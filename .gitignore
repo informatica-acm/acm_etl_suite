@@ -1,0 +1,22 @@
+# Ignorar el entorno virtual
+venv/
+.venv/
+
+# Ignorar archivos de configuración sensibles
+.env
+
+# Ignorar archivos de Python generados automáticamente
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignorar directorios de datos y logs generados
+data_acm/
+logs_acm/
+
+# Ignorar archivos específicos de sistema operativo o IDE
+.DS_Store
+.vscode/
+.idea/
+*.log
