@@ -1,86 +1,97 @@
 import pandas as pd
-from src.core.acm_utils import setup_acm_logging
 
-logger = setup_acm_logging(__name__)
+# --- Transformadores para Datos Maestros ---
 
-def clean_acm_data(df):
-    """
-    Realiza una limpieza básica de datos para DataFrames de ACM.
-    - Elimina filas duplicadas.
-    - Puedes añadir más lógica de limpieza aquí (ej. manejo de nulos, estandarización de texto).
-    """
-    if df is None:
-        logger.warning("DataFrame de entrada es None para limpieza. Retornando None.")
-        return None
+def transform_canales_from_obras(df_obras_raw):
+    """Extrae, limpia y devuelve un DataFrame único de Canales desde la planilla de Obras."""
     
-    initial_rows = len(df)
-    df_cleaned = df.drop_duplicates().copy() # Usar .copy() para evitar SettingWithCopyWarning
+    # Seleccionamos las columnas que nos interesan
+    df_canales = df_obras_raw[['CANAL', 'SECCION']].copy()
     
-    if initial_rows != len(df_cleaned):
-        logger.info(f"Limpieza de datos ACM: {initial_rows - len(df_cleaned)} duplicados eliminados.")
+    # --- LÍNEA CLAVE AÑADIDA ---
+    # Eliminamos cualquier fila donde la columna 'CANAL' esté vacía.
+    # Esto previene el error de NotNullViolation.
+    df_canales.dropna(subset=['CANAL'], inplace=True)
     
-    # Ejemplo de manejo de nulos: rellenar con un valor por defecto o hacia adelante/atrás
-    # df_cleaned.fillna(method='ffill', inplace=True) 
-    # df_cleaned['columna_numerica'] = pd.to_numeric(df_cleaned['columna_numerica'], errors='coerce')
-    # df_cleaned['columna_texto'] = df_cleaned['columna_texto'].str.strip().str.lower()
-
-    return df_cleaned
-
-def aggregate_acm_data(df, group_by_column, aggregate_column, agg_func='sum'):
-    """
-    Realiza una agregación básica de datos para DataFrames de ACM.
-    Agrupa por una o más columnas y aplica una función de agregación.
-    """
-    if df is None:
-        logger.warning("DataFrame de entrada es None para agregación. Retornando None.")
-        return None
+    # Renombramos las columnas para que coincidan con la base de datos.
+    df_canales.rename(columns={'CANAL': 'nombre', 'SECCION': 'sector'}, inplace=True)
     
-    try:
-        aggregated_df = df.groupby(group_by_column)[aggregate_column].agg(agg_func).reset_index()
-        logger.info(f"Datos ACM agregados por '{group_by_column}' usando '{agg_func}'.")
-        return aggregated_df
-    except KeyError as e:
-        logger.error(f"Error al agregar datos: Columna no encontrada - {e}. Asegúrate de que las columnas existan.")
-        return None
-    except Exception as e:
-        logger.error(f"Error inesperado durante la agregación: {e}")
-        return None
+    # Finalmente, eliminamos duplicados para tener una lista única de canales.
+    return df_canales.drop_duplicates(subset=['nombre']).reset_index(drop=True)
 
-# Puedes añadir más funciones de transformación aquí (ej. estandarización de nombres, cálculos específicos)
-def standardize_column_names(df):
-    """Estandariza los nombres de las columnas a un formato snake_case."""
-    if df is None:
+def transform_materiales_from_obras_columns(df_obras_raw):
+    """Despivota los nombres de las columnas de materiales para crear una tabla maestra."""
+    material_cols = [col for col in df_obras_raw.columns if '(' in col and ')' in col]
+    
+    materiales_list = []
+    for col in material_cols:
+        try:
+            nombre = col.split('(')[0].strip()
+            unidad = col.split('(')[1].replace(')', '').strip()
+            materiales_list.append({'nombre': nombre, 'unidad': unidad})
+        except IndexError:
+            print(f"Advertencia: La columna '{col}' no sigue el formato 'Nombre (Unidad)' y será ignorada.")
+            continue
+            
+    return pd.DataFrame(materiales_list).drop_duplicates(subset=['nombre']).reset_index(drop=True)
+
+# --- Transformadores para Datos Transaccionales ---
+
+def _asignar_subtemporada(fecha, subtemporadas_df):
+    """Función auxiliar para encontrar el ID de la subtemporada basado en una fecha."""
+    if pd.isna(fecha):
         return None
-    original_cols = df.columns.tolist()
-    new_cols = []
-    for col in original_cols:
-        new_col = col.strip().lower().replace(' ', '_').replace('-', '_')
-        new_cols.append(new_col)
-    df.columns = new_cols
-    logger.info(f"Nombres de columnas estandarizados: {original_cols} -> {new_cols}")
-    return df
+    for _, fila in subtemporadas_df.iterrows():
+        if fila['fecha_inicio'] <= fecha.date() <= fila['fecha_fin']:
+            return fila['id_subtemporada']
+    return None
 
-def transform_obras(df):
-    """
-    Transforma el DataFrame de obras y devuelve un diccionario con el DataFrame principal.
-    """
-    # Aquí puedes aplicar lógica real si es necesario
-    return {"df_obras": df}
+def transform_obras_and_materiales(df_raw, engine, subtemporadas_df):
+    """Transforma Obras y despivota sus Materiales para crear MaterialesEnObra."""
+    df_raw['fecha_publicacion'] = pd.to_datetime(df_raw['fecha_publicacion'], errors='coerce')
+    df_raw['id_subtemporada'] = df_raw['fecha_publicacion'].apply(lambda x: _asignar_subtemporada(x, subtemporadas_df))
+    
+    # Mapeo de columnas y limpieza de Obras
+    # (Añade aquí el resto de las columnas que necesites de tu Excel)
+    df_obras = df_raw[['id_subtemporada', 'CODIGO', 'OBRA', 'Ppto', 'Real Ejecutado', 'fecha_publicacion']].copy()
+    df_obras.rename(columns={
+        'CODIGO': 'codigo_obra',
+        'OBRA': 'nombre',
+        'Ppto': 'presupuesto',
+        'Real Ejecutado': 'real_ejecutado'
+    }, inplace=True)
+    
+    # Obtener id_canal
+    canales_db = pd.read_sql("SELECT id_canal, nombre FROM canales", engine)
+    df_obras = pd.merge(df_obras, canales_db, left_on='Nombre del Canal', right_on='nombre', how='left')
+    df_obras.drop(columns=['nombre_y'], inplace=True) # Limpiar columna duplicada
+    df_obras.rename(columns={'nombre_x': 'nombre'}, inplace=True)
 
-def transform_labores(df):
-    """
-    Transforma el DataFrame de labores y lo divide en labores y materiales.
-    """
-    df_labores = df[["id_labor", "canal_id", "codigo_labor", "fecha_labor", "responsable"]].copy()
-    df_materiales = df[["id_labor", "material", "cantidad", "costo_unitario"]].copy()
+
+    # --- Despivotar Materiales para MaterialesEnObra ---
+    id_cols = ['CODIGO']
+    material_cols = [col for col in df_raw.columns if '(' in col and ')' in col]
+    
+    df_melted = df_raw.melt(
+        id_vars=id_cols,
+        value_vars=material_cols,
+        var_name='material_full',
+        value_name='cantidad_usada'
+    )
+    
+    df_melted = df_melted[df_melted['cantidad_usada'].notna() & (df_melted['cantidad_usada'] > 0)].copy()
+    df_melted['nombre_material'] = df_melted['material_full'].apply(lambda x: x.split('(')[0].strip())
+
+    # Obtener IDs de la base de datos para crear las relaciones
+    obras_db = pd.read_sql("SELECT id_obra, codigo_obra FROM Obras", engine)
+    materiales_db = pd.read_sql("SELECT id_material, nombre FROM materiales", engine)
+    
+    df_final_materiales = pd.merge(df_melted, obras_db, left_on='CODIGO', right_on='codigo_obra')
+    df_final_materiales = pd.merge(df_final_materiales, materiales_db, left_on='nombre_material', right_on='nombre')
+    
+    df_final_materiales = df_final_materiales[['id_obra', 'id_material', 'cantidad_usada']].copy()
 
     return {
-        "df_labores": df_labores,
-        "df_materiales": df_materiales
+        "obras": df_obras,
+        "materiales_en_obra": df_final_materiales
     }
-
-def transform_bodega(df):
-    """
-    Transforma los datos de bodega.
-    """
-    return {"df_bodega": df}

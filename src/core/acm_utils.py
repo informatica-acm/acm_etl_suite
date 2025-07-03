@@ -1,62 +1,59 @@
-import logging
 import os
-from sqlalchemy import create_engine
-from dotenv import load_dotenv
-from config.acm_settings import LOG_FILE_ACM, LOGGING_CONFIG_ACM
+import sqlalchemy
+import json
+import pandas as pd
+from sqlalchemy import create_engine, text
 
-# =======================
-# 1. Setup de logging
-# =======================
-
-def setup_acm_logging(name):
-    """
-    Configura el logger para un módulo específico del proyecto ACM.
-    Los logs se escribirán en un archivo y en la consola.
-    """
-    logger = logging.getLogger(name)
-    logger.setLevel(LOGGING_CONFIG_ACM['level'])
-
-    if not logger.handlers:
-        file_handler = logging.FileHandler(LOG_FILE_ACM)
-        file_handler.setFormatter(logging.Formatter(LOGGING_CONFIG_ACM['format']))
-        logger.addHandler(file_handler)
-
-        stream_handler = logging.StreamHandler()
-        stream_handler.setFormatter(logging.Formatter(LOGGING_CONFIG_ACM['format']))
-        logger.addHandler(stream_handler)
-
-    return logger
-
-# =======================
-# 2. Setup del motor DB
-# =======================
-
-load_dotenv()
-
-SUPABASE_DB_TYPE = os.getenv("SUPABASE_DB_TYPE")
-SUPABASE_DB_USER = os.getenv("SUPABASE_DB_USER")
-SUPABASE_DB_PASSWORD = os.getenv("SUPABASE_DB_PASSWORD")
-SUPABASE_DB_HOST = os.getenv("SUPABASE_DB_HOST")
-SUPABASE_DB_PORT = os.getenv("SUPABASE_DB_PORT")
-SUPABASE_DB_NAME = os.getenv("SUPABASE_DB_NAME")
-
-def get_acm_db_engine(db_type, db_user, db_pass, db_host, db_port, db_name):
+def get_db_engine():
+    """Crea y devuelve un engine de SQLAlchemy para la conexión a la BD."""
     try:
-        db_port = int(db_port)
-        connection_str = f"{db_type}://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}"
-        engine = create_engine(connection_str)
-        logging.getLogger(__name__).info("Motor de conexión a base de datos creado exitosamente.")
-        return engine
+        db_user = os.getenv("DB_USER")
+        db_password = os.getenv("DB_PASSWORD")
+        db_host = os.getenv("DB_HOST")
+        db_port = os.getenv("DB_PORT")
+        db_name = os.getenv("DB_NAME")
+        
+        if not all([db_user, db_password, db_host, db_port, db_name]):
+            raise ValueError("Faltan variables de entorno para la conexión a la base de datos.")
+            
+        db_url = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+        return create_engine(db_url)
     except Exception as e:
-        logging.getLogger(__name__).error(f"Error al crear motor de DB para ACM: {e}")
-        return None
+        print(f"Error al crear la conexión a la base de datos: {e}")
+        raise
 
-# Motor global para toda la suite ETL
-supabase_engine = get_acm_db_engine(
-    SUPABASE_DB_TYPE,
-    SUPABASE_DB_USER,
-    SUPABASE_DB_PASSWORD,
-    SUPABASE_DB_HOST,
-    SUPABASE_DB_PORT,
-    SUPABASE_DB_NAME
-)
+def get_subtemporadas(engine):
+    """Obtiene las subtemporadas de la base de datos para usarlas en las transformaciones."""
+    return pd.read_sql("SELECT id_subtemporada, fecha_inicio, fecha_fin FROM SubTemporadas", engine)
+
+def iniciar_log(engine, tipo_tarea, area):
+    """Inserta una nueva fila en LogETL marcando el inicio del proceso y devuelve el ID."""
+    with engine.connect() as conn:
+        result = conn.execute(text(
+            """
+            INSERT INTO LogETL (tipo_tarea, area_negocio, estado) 
+            VALUES (:tipo, :area, 'Iniciado') RETURNING id_log
+            """
+        ), {"tipo": tipo_tarea, "area": area})
+        conn.commit()
+        return result.scalar_one()
+
+def finalizar_log(engine, log_id, estado, registros=None, mensaje_error=None):
+    """Actualiza la fila del log con el resultado final del proceso."""
+    with engine.connect() as conn:
+        conn.execute(text(
+            """
+            UPDATE LogETL SET
+                timestamp_fin = CURRENT_TIMESTAMP,
+                estado = :estado,
+                registros_procesados = :registros,
+                mensaje_error = :error
+            WHERE id_log = :id
+            """
+        ), {
+            "estado": estado,
+            "registros": json.dumps(registros) if registros else None,
+            "error": mensaje_error,
+            "id": log_id
+        })
+        conn.commit()
