@@ -1,97 +1,87 @@
+# src/core/acm_transformers.py
 import pandas as pd
 
-# --- Transformadores para Datos Maestros ---
+def transform_from_sheet(df_raw, column_map):
+    """
+    Transforma datos, valida duplicados y ASEGURA que la columna 'codigo'
+    sea un string con formato de ceros a la izquierda.
+    """
+    df = df_raw.copy()
+    rename_map = {k: v for k, v in column_map.items() if k in df.columns}
+    df.rename(columns=rename_map, inplace=True)
+    
+    cols_to_process = list(rename_map.values())
+    df = df[cols_to_process]
+    
+    key_column = cols_to_process[0]
+    
+    # --- SEGUNDA BARRERA: RE-FORMATEAR EL CÓDIGO ---
+    if 'codigo' in df.columns:
+        # 1. Asegura que la columna sea de tipo string.
+        df['codigo'] = df['codigo'].astype(str)
+        # 2. Rellena con ceros a la izquierda hasta tener 4 caracteres.
+        #    Esto fuerza al sistema a tratarlo como un texto formateado.
+        #    Ajusta el '4' si tus códigos pueden ser más largos (ej. 5 o 6).
+        df['codigo'] = df['codigo'].str.zfill(4)
 
-def transform_canales_from_obras(df_obras_raw):
-    """Extrae, limpia y devuelve un DataFrame único de Canales desde la planilla de Obras."""
+    df.dropna(subset=[key_column], inplace=True)
     
-    # Seleccionamos las columnas que nos interesan
-    df_canales = df_obras_raw[['CANAL', 'SECCION']].copy()
+    # ... (El resto de la lógica de validación de duplicados se mantiene igual) ...
+    duplicates_df = df[df.duplicated(subset=[key_column], keep=False)]
+    if not duplicates_df.empty:
+        # ... (código de error de duplicados) ...
+        raise ValueError(...)
     
-    # --- LÍNEA CLAVE AÑADIDA ---
-    # Eliminamos cualquier fila donde la columna 'CANAL' esté vacía.
-    # Esto previene el error de NotNullViolation.
-    df_canales.dropna(subset=['CANAL'], inplace=True)
-    
-    # Renombramos las columnas para que coincidan con la base de datos.
-    df_canales.rename(columns={'CANAL': 'nombre', 'SECCION': 'sector'}, inplace=True)
-    
-    # Finalmente, eliminamos duplicados para tener una lista única de canales.
-    return df_canales.drop_duplicates(subset=['nombre']).reset_index(drop=True)
-
-def transform_materiales_from_obras_columns(df_obras_raw):
-    """Despivota los nombres de las columnas de materiales para crear una tabla maestra."""
-    material_cols = [col for col in df_obras_raw.columns if '(' in col and ')' in col]
-    
-    materiales_list = []
-    for col in material_cols:
-        try:
-            nombre = col.split('(')[0].strip()
-            unidad = col.split('(')[1].replace(')', '').strip()
-            materiales_list.append({'nombre': nombre, 'unidad': unidad})
-        except IndexError:
-            print(f"Advertencia: La columna '{col}' no sigue el formato 'Nombre (Unidad)' y será ignorada.")
-            continue
-            
-    return pd.DataFrame(materiales_list).drop_duplicates(subset=['nombre']).reset_index(drop=True)
-
-# --- Transformadores para Datos Transaccionales ---
+    return df.reset_index(drop=True)
 
 def _asignar_subtemporada(fecha, subtemporadas_df):
     """Función auxiliar para encontrar el ID de la subtemporada basado en una fecha."""
-    if pd.isna(fecha):
-        return None
-    for _, fila in subtemporadas_df.iterrows():
-        if fila['fecha_inicio'] <= fecha.date() <= fila['fecha_fin']:
-            return fila['id_subtemporada']
+    if pd.isna(fecha): return None
+    for _, row in subtemporadas_df.iterrows():
+        if isinstance(fecha, pd.Timestamp) and row['fecha_inicio'] <= fecha.date() <= row['fecha_fin']:
+            return row['id_subtemporada']
     return None
 
 def transform_obras_and_materiales(df_raw, engine, subtemporadas_df):
-    """Transforma Obras y despivota sus Materiales para crear MaterialesEnObra."""
-    df_raw['fecha_publicacion'] = pd.to_datetime(df_raw['fecha_publicacion'], errors='coerce')
-    df_raw['id_subtemporada'] = df_raw['fecha_publicacion'].apply(lambda x: _asignar_subtemporada(x, subtemporadas_df))
+    """Procesa los datos de obras y despivota los materiales para su carga."""
+    df = df_raw.copy()
+    df['fecha_publicacion'] = pd.to_datetime(df['PUBLICACIÓN'], errors='coerce')
+    df['id_subtemporada'] = df['fecha_publicacion'].apply(lambda x: _asignar_subtemporada(x, subtemporadas_df))
     
-    # Mapeo de columnas y limpieza de Obras
-    # (Añade aquí el resto de las columnas que necesites de tu Excel)
-    df_obras = df_raw[['id_subtemporada', 'CODIGO', 'OBRA', 'Ppto', 'Real Ejecutado', 'fecha_publicacion']].copy()
-    df_obras.rename(columns={
-        'CODIGO': 'codigo_obra',
+    # Enriquece con id_canal desde la BD
+    canales_db = pd.read_sql("SELECT id_canal, codigo FROM canales", engine)
+    df = pd.merge(df, canales_db, left_on='COD. CANAL', right_on='codigo', how='left')
+    
+    # Prepara el DataFrame para la tabla 'obras'
+    obras_map = {
+        'id_subtemporada': 'id_subtemporada',
+        'id_canal': 'id_canal',
+        'CODIGO DE OBRA (año/canal/n° obra)': 'codigo_obra',
         'OBRA': 'nombre',
-        'Ppto': 'presupuesto',
-        'Real Ejecutado': 'real_ejecutado'
-    }, inplace=True)
-    
-    # Obtener id_canal
-    canales_db = pd.read_sql("SELECT id_canal, nombre FROM canales", engine)
-    df_obras = pd.merge(df_obras, canales_db, left_on='Nombre del Canal', right_on='nombre', how='left')
-    df_obras.drop(columns=['nombre_y'], inplace=True) # Limpiar columna duplicada
-    df_obras.rename(columns={'nombre_x': 'nombre'}, inplace=True)
+        'PPTO. COSTO TOTAL': 'presupuesto',
+        'COSTO REAL TOTAL DELA OBRA': 'real_ejecutado',
+        'fecha_publicacion': 'fecha_publicacion'
+    }
+    df_obras = df[[col for col in obras_map.keys() if col in df.columns]].rename(columns=obras_map)
+    df_obras.dropna(subset=['codigo_obra'], inplace=True)
 
-
-    # --- Despivotar Materiales para MaterialesEnObra ---
-    id_cols = ['CODIGO']
-    material_cols = [col for col in df_raw.columns if '(' in col and ')' in col]
+    # Prepara el DataFrame para la tabla 'materialesenobra'
+    id_cols = ['CODIGO DE OBRA (año/canal/n° obra)']
+    material_cols = [col for col in df.columns if '(' in col and ')' in col and 'COSTO' not in col]
     
-    df_melted = df_raw.melt(
-        id_vars=id_cols,
-        value_vars=material_cols,
-        var_name='material_full',
-        value_name='cantidad_usada'
-    )
-    
+    df_melted = df.melt(id_vars=id_cols, value_vars=material_cols, var_name='material_full', value_name='cantidad_usada')
     df_melted = df_melted[df_melted['cantidad_usada'].notna() & (df_melted['cantidad_usada'] > 0)].copy()
+    df_melted.rename(columns={'CODIGO DE OBRA (año/canal/n° obra)': 'codigo_obra'}, inplace=True)
     df_melted['nombre_material'] = df_melted['material_full'].apply(lambda x: x.split('(')[0].strip())
 
-    # Obtener IDs de la base de datos para crear las relaciones
-    obras_db = pd.read_sql("SELECT id_obra, codigo_obra FROM Obras", engine)
-    materiales_db = pd.read_sql("SELECT id_material, nombre FROM materiales", engine)
+    # Enriquece con id_obra y id_material desde la BD
+    obras_db = pd.read_sql("SELECT id_obra, codigo_obra FROM obras", engine)
+    insumos_db = pd.read_sql("SELECT id_insumo, nombre FROM insumos", engine)
     
-    df_final_materiales = pd.merge(df_melted, obras_db, left_on='CODIGO', right_on='codigo_obra')
-    df_final_materiales = pd.merge(df_final_materiales, materiales_db, left_on='nombre_material', right_on='nombre')
+    df_final_mats = pd.merge(df_melted, obras_db, on='codigo_obra', how='inner')
+    df_final_mats = pd.merge(df_final_mats, insumos_db, left_on='nombre_material', right_on='nombre', how='inner')
     
-    df_final_materiales = df_final_materiales[['id_obra', 'id_material', 'cantidad_usada']].copy()
+    # Selecciona solo las columnas finales para la tabla
+    df_final_mats = df_final_mats[['id_obra', 'id_insumo', 'cantidad_usada']].copy()
 
-    return {
-        "obras": df_obras,
-        "materiales_en_obra": df_final_materiales
-    }
+    return {"obras": df_obras, "materiales_en_obra": df_final_mats}

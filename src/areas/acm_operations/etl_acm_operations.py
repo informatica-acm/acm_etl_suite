@@ -1,62 +1,72 @@
+# src/areas/acm_operations/etl_acm_operations.py
 from src.core import acm_extractors, acm_transformers, acm_loaders, acm_utils
 from config.acm_settings import settings
 
 def run_master_data_population_with_logging():
+    """Tarea para poblar las tablas maestras desde el archivo central 'Códigos.xlsx'."""
     engine = acm_utils.get_db_engine()
     log_id = None
     registros = {}
     try:
         log_id = acm_utils.iniciar_log(engine, 'populate_masters', 'operations')
         
-        # Poblar Temporadas y SubTemporadas (Esto se asume que se hace manualmente en la BD por ahora)
-        print("Poblando datos maestros desde el archivo de Obras...")
-        df_obras_raw = acm_extractors.extract_from_excel(settings.operations.obras_path, sheet_name="Obras", skiprows=5)
+        # Mapeo central que define qué hoja del Excel corresponde a qué tabla
+        # de la base de datos y cómo se deben renombrar las columnas.
+        # ¡IMPORTANTE! Ajusta las claves (ej. "CANAL") a los nombres exactos de las columnas en tu Excel.
+        master_data_map = {
+            "oficinas": {"sheet": "OFICINAS", "cols": {"CODIGO": "codigo", "OFICINA": "nombre"}},
+            "bodegas": {"sheet": "BODEGAS", "cols": {"CODIGO": "codigo", "BODEGA": "nombre"}},
+            "canales": {"sheet": "CANALES", "cols": {"CODIGO": "codigo", "CANAL": "nombre", "TIPO": "tipo"}},
+            "insumos": {"sheet": "INSUMOS", "cols": {"CODIGO": "codigo", "INSUMOS": "nombre", "UNIDAD": "unidad"}},
+            # Añade aquí más tablas maestras que quieras poblar desde 'Códigos.xlsx'
+        }
 
-        # --- INICIO DE CÓDIGO DE DIAGNÓSTICO DE COLUMNAS ---
-        """ print("\n--- Columnas encontradas en '1. Obras.xlsx' ---")
-        print(df_obras_raw.columns.tolist())
-        print("------------------------------------------------") """
-        # --- FIN DE CÓDIGO DE DIAGNÓSTICO ---
-        
-        # Cargar Canales
-        df_canales = acm_transformers.transform_canales_from_obras(df_obras_raw)
-        registros['canales'] = acm_loaders.load_to_acm_database(df_canales, "canales", engine, unique_column='nombre')
-        
-        # Cargar Materiales
-        df_materiales = acm_transformers.transform_materiales_from_obras_columns(df_obras_raw)
-        registros['materiales'] = acm_loaders.load_to_acm_database(df_materiales, "materiales", engine, unique_column='nombre')
+        # Itera sobre el mapa y procesa cada tabla maestra.
+        for table, config in master_data_map.items():
+            print(f"Poblando tabla '{table}'...")
+            df_raw = acm_extractors.extract_from_excel(settings.operations.codigos_path, sheet_name=config["sheet"])
+            df_transformed = acm_transformers.transform_from_sheet(df_raw, config["cols"])
+            registros[table] = acm_loaders.load_to_acm_database(df_transformed, table, engine, unique_column='codigo')
 
+        # Finaliza el log como exitoso.
         acm_utils.finalizar_log(engine, log_id, 'Exitoso', registros)
-        print(f"✅ Población de datos maestros de Operaciones completada. Resumen: {registros}")
+        print(f"✅ Población de datos maestros completada. Resumen: {registros}")
 
     except Exception as e:
-        print(f"❌ ERROR en la población de datos maestros de Operaciones: {e}")
+        print(f"❌ ERROR en la población de datos maestros: {e}")
         if log_id:
             acm_utils.finalizar_log(engine, log_id, 'Fallido', mensaje_error=str(e))
 
 def run_transactional_etl_with_logging():
+    """Tarea para cargar datos periódicos como Obras y sus materiales usados."""
     engine = acm_utils.get_db_engine()
     log_id = None
     registros = {}
     try:
         log_id = acm_utils.iniciar_log(engine, 'run_transactions', 'operations')
-
+        
+        # Obtiene las subtemporadas desde la BD para poder asignar las obras
         subtemporadas_df = acm_utils.get_subtemporadas(engine)
         if subtemporadas_df.empty:
-            raise ValueError("La tabla 'SubTemporadas' está vacía. Por favor, puebla los datos maestros primero.")
+            raise ValueError("La tabla 'subtemporadas' está vacía. Debes poblarla manualmente primero.")
 
-        # Procesar Obras y Materiales
-        df_obras_raw = acm_extractors.extract_from_excel(settings.operations.obras_path, sheet_name="Obras")
-        transformed_obras = acm_transformers.transform_obras_and_materiales(df_obras_raw, engine, subtemporadas_df)
-        registros['obras'] = acm_loaders.load_to_acm_database(transformed_obras['obras'], "Obras", engine, unique_column='codigo_obra')
-        registros['materiales_en_obra'] = acm_loaders.load_to_acm_database(transformed_obras['materiales_en_obra'], "MaterialesEnObra", engine)
+        # Procesa el archivo de Obras
+        print("Procesando Obras y Materiales en Obra...")
+        df_obras_raw = acm_extractors.extract_from_excel(settings.operations.obras_path, sheet_name="Obras", skiprows=5)
         
-        # (Aquí añadirías la lógica para Labores y Bodega de forma similar)
+        # Llama a la función que transforma las obras y despivota los materiales
+        transformed = acm_transformers.transform_obras_and_materiales(df_obras_raw, engine, subtemporadas_df)
+        
+        # Carga las obras y luego los materiales asociados
+        registros['obras'] = acm_loaders.load_to_acm_database(transformed['obras'], "obras", engine, unique_column='codigo_obra')
+        registros['materialesenobra'] = acm_loaders.load_to_acm_database(transformed['materiales_en_obra'], "materialesenobra", engine)
+        
+        # (Aquí se añadiría la lógica para procesar '2. Labores.xlsx' de forma similar)
 
         acm_utils.finalizar_log(engine, log_id, 'Exitoso', registros)
         print(f"✅ Carga transaccional de Operaciones completada. Resumen: {registros}")
         
     except Exception as e:
-        print(f"❌ ERROR en el ETL transaccional de Operaciones: {e}")
+        print(f"❌ ERROR en el ETL transaccional: {e}")
         if log_id:
             acm_utils.finalizar_log(engine, log_id, 'Fallido', mensaje_error=str(e))
